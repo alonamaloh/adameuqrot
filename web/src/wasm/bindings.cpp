@@ -1,0 +1,1041 @@
+// Emscripten bindings for the checkers engine
+// Exposes Board, Move, Searcher, and helper functions to JavaScript
+
+#include <emscripten/bind.h>
+#include <emscripten/val.h>
+#include <memory>
+#include <vector>
+#include <cstdint>
+#include <bit>
+#include <chrono>
+#include <string>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "../../../core/board.hpp"
+#include "../../../core/movegen.hpp"
+#include "../../../core/notation.hpp"
+#include "../../../core/random.hpp"
+#include "../../../search/search.hpp"
+#include "../../../tablebase/tablebase.hpp"
+#include "../../../tablebase/compression.hpp"
+#include "../../../nn/mlp.hpp"
+
+using namespace emscripten;
+
+// Engine version - update this when making changes to help debug caching issues
+#define ENGINE_VERSION __DATE__ " " __TIME__
+
+namespace {
+    // Constants for chunk-based tablebase loading
+    constexpr int CHUNK_SIZE = 16384;  // 16 KB chunks
+    constexpr int HEADER_SIZE = 33;    // DTM file header size
+
+    // Global RNG for evaluation noise, seeded with system clock
+    RandomBits g_rng(std::chrono::steady_clock::now().time_since_epoch().count());
+
+    // Global stop flag for interrupting search
+    std::atomic<bool> g_stop_flag{false};
+
+    // Helper to build notation string from path
+    std::string buildNotation(const std::vector<int>& path, bool is_capture, bool white_view) {
+        std::string result;
+        for (size_t i = 0; i < path.size(); ++i) {
+            if (i > 0) result += is_capture ? "x" : "-";
+            int sq = white_view ? (path[i] + 1) : (32 - path[i]);
+            result += std::to_string(sq);
+        }
+        return result;
+    }
+
+    // Helper to convert Material to string key
+    std::string material_key(const Material& m) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d%d%d%d%d%d",
+                 m.back_white_pawns, m.back_black_pawns,
+                 m.other_white_pawns, m.other_black_pawns,
+                 m.white_queens, m.black_queens);
+        return buf;
+    }
+
+    // Lazy-loading DTM tablebase manager
+    // Calls into JS to load chunks on demand
+    class WasmDTMTablebaseManager {
+    public:
+        tablebase::DTM lookup_dtm(const Board& board) const {
+            // Check if tablebases are available in JS
+            val tablebasesAvailable = val::global("tablebasesAvailable");
+            if (tablebasesAvailable.isUndefined() || !tablebasesAvailable().as<bool>()) {
+                return tablebase::DTM_UNKNOWN;
+            }
+
+            Material m = get_material(board);
+            std::string key = material_key(m);
+            std::size_t idx = board_to_index(board, m);
+
+            // Compute chunk index and offset
+            // File layout: 33-byte header + DTM values (1 byte each)
+            int file_offset = HEADER_SIZE + static_cast<int>(idx);
+            int chunk_idx = file_offset / CHUNK_SIZE;
+            int offset_in_chunk = file_offset % CHUNK_SIZE;
+
+            // Call JS to get the chunk (it handles caching)
+            val loadChunk = val::global("loadTablebaseChunk");
+            val chunk = loadChunk(key, chunk_idx);
+
+            if (chunk.isNull() || chunk.isUndefined()) {
+                return tablebase::DTM_UNKNOWN;
+            }
+
+            // Check if offset is within chunk bounds
+            int chunk_length = chunk["length"].as<int>();
+            if (offset_in_chunk >= chunk_length) {
+                return tablebase::DTM_UNKNOWN;
+            }
+
+            // Get the DTM value (signed byte)
+            int dtm_value = chunk[offset_in_chunk].as<int>();
+            return static_cast<tablebase::DTM>(dtm_value);
+        }
+
+        // Find best move using DTM lookup
+        bool find_best_move(const Board& board, Move& best_move, tablebase::DTM& best_dtm) const {
+            MoveList moves;
+            generateMoves(board, moves);
+
+            if (moves.empty()) {
+                return false;
+            }
+
+            tablebase::DTM current_dtm = lookup_dtm(board);
+            tablebase::DTM best_opp_dtm = tablebase::DTM_UNKNOWN;
+            bool found = false;
+
+            for (const Move& move : moves) {
+                Board child = makeMove(board, move);
+
+                Material child_m = get_material(child);
+                tablebase::DTM opp_dtm;
+                // Gana-pierde: no pieces = WIN for that side
+                if (child_m.white_pieces() == 0) {
+                    opp_dtm = 1;  // dtm_win(1): they WIN (gana-pierde)
+                } else {
+                    opp_dtm = lookup_dtm(child);
+                }
+
+                if (opp_dtm == tablebase::DTM_UNKNOWN) {
+                    continue;
+                }
+
+                bool dominated = false;
+                if (!found) {
+                    dominated = false;
+                } else if (current_dtm > 0) {
+                    if (best_opp_dtm < 0 && opp_dtm >= 0) {
+                        dominated = true;
+                    } else if (best_opp_dtm >= 0 && opp_dtm < 0) {
+                        dominated = false;
+                    } else if (best_opp_dtm < 0 && opp_dtm < 0) {
+                        dominated = (opp_dtm <= best_opp_dtm);
+                    } else {
+                        dominated = true;
+                    }
+                } else if (current_dtm < 0) {
+                    dominated = (opp_dtm <= best_opp_dtm);
+                } else {
+                    dominated = (opp_dtm >= best_opp_dtm);
+                }
+
+                if (!dominated) {
+                    best_opp_dtm = opp_dtm;
+                    best_move = move;
+                    found = true;
+                }
+            }
+
+            if (found) {
+                if (best_opp_dtm == tablebase::DTM_LOSS_TERMINAL) {
+                    best_dtm = 1;
+                } else if (best_opp_dtm < 0) {
+                    best_dtm = static_cast<tablebase::DTM>(-best_opp_dtm + 1);
+                } else if (best_opp_dtm == 0) {
+                    best_dtm = 0;
+                } else {
+                    best_dtm = static_cast<tablebase::DTM>(-best_opp_dtm);
+                }
+            }
+
+            return found;
+        }
+    };
+
+    WasmDTMTablebaseManager g_tb_manager;
+
+    // Lazy-loading CWDL (compressed WDL) tablebase manager
+    // Loads entire CWDL files from JS on demand, caches in memory.
+    // Handles the conjugate trick: if direct lookup fails, tries the
+    // conjugate material via depth-1 search.
+    class WasmCWDLTablebaseManager {
+    public:
+        // Main entry point: look up WDL for any position (quiet or tense).
+        // Handles capture sequences, sub-tablebases, and conjugate trick.
+        std::optional<int> lookup_wdl(const Board& board) const {
+            Material m = get_material(board);
+
+            // Terminal checks
+            if (m.white_pieces() == 0) return -1;  // LOSS
+            if (m.black_pieces() == 0) return 1;   // WIN
+
+            // For quiet positions, try direct or conjugate lookup
+            if (!has_captures(board)) {
+                return lookup_quiet(board);
+            }
+
+            // Tense position: search through forced captures
+            return capture_search(board);
+        }
+
+    private:
+        // Cache with size limit to prevent OOM.
+        // 730 CWDL files × ~600KB avg = ~439 MB total, which exceeds WASM memory.
+        // Only a handful of material configs are needed per search position.
+        static constexpr std::size_t MAX_CACHE_ENTRIES = 100;
+        mutable std::unordered_map<std::string, CompressedTablebase> cache_;
+        mutable std::unordered_set<std::string> not_found_;  // Keys with no file
+
+        const CompressedTablebase* get_table(const std::string& key) const {
+            // Check cache
+            auto it = cache_.find(key);
+            if (it != cache_.end()) {
+                return &it->second;
+            }
+
+            // Check negative cache (keys we know have no file)
+            if (not_found_.count(key)) {
+                return nullptr;
+            }
+
+            // Load from JS
+            val loadFile = val::global("loadCWDLFile");
+            if (loadFile.isUndefined()) {
+                not_found_.insert(key);
+                return nullptr;
+            }
+
+            val data = loadFile(key);
+            if (data.isNull() || data.isUndefined()) {
+                not_found_.insert(key);
+                return nullptr;
+            }
+
+            // Evict all cached tables if we're at the limit.
+            // The working set for the current position will reload quickly.
+            if (cache_.size() >= MAX_CACHE_ENTRIES) {
+                cache_.clear();
+            }
+
+            // Bulk copy JS Uint8Array to C++ buffer via typed_memory_view
+            unsigned int length = data["length"].as<unsigned int>();
+            std::vector<std::uint8_t> buffer(length);
+            val memoryView = val(typed_memory_view(length, buffer.data()));
+            memoryView.call<void>("set", data);
+
+            CompressedTablebase tb = load_compressed_from_buffer(buffer.data(), buffer.size());
+            if (tb.empty()) {
+                not_found_.insert(key);
+                return nullptr;
+            }
+
+            cache_[key] = std::move(tb);
+            return &cache_[key];
+        }
+
+        // Look up a quiet position directly in whatever table it belongs to
+        std::optional<int> lookup_quiet(const Board& board) const {
+            Material m = get_material(board);
+            if (m.white_pieces() == 0) return -1;
+            if (m.black_pieces() == 0) return 1;
+
+            // Try direct table
+            const CompressedTablebase* tb = get_table(material_key(m));
+            if (tb) {
+                std::size_t idx = board_to_index(board, m);
+                Value v = lookup_compressed(*tb, idx);
+                if (v == Value::UNKNOWN) return std::nullopt;
+                return value_to_wdl(v);
+            }
+
+            // Try conjugate: generate all moves, look up each child
+            Material conj_m = flip(m);
+            const CompressedTablebase* conj_tb = get_table(material_key(conj_m));
+            if (conj_tb) {
+                return conjugate_search(board);
+            }
+
+            return std::nullopt;
+        }
+
+        // Negamax through forced capture sequences, using multi-table lookup
+        // for quiet leaf positions (handles material changes from captures)
+        std::optional<int> capture_search(const Board& board) const {
+            MoveList moves;
+            generateMoves(board, moves);
+            if (moves.empty()) return 1;  // Gana-pierde: no moves = WIN
+
+            int best = -2;
+            for (const Move& move : moves) {
+                Board child = makeMove(board, move);
+                if (child.white == 0) return -1;  // Gana-pierde: opponent has no pieces = they win = we lose
+
+                std::optional<int> child_wdl;
+                if (has_captures(child)) {
+                    child_wdl = capture_search(child);  // Continue capture sequence
+                } else {
+                    child_wdl = lookup_quiet(child);    // Quiet: look up in table
+                }
+                if (!child_wdl) return std::nullopt;
+
+                int score = -(*child_wdl);
+                if (score > best) best = score;
+                if (best == 1) break;
+            }
+
+            return (best > -2) ? std::optional<int>(best) : std::nullopt;
+        }
+
+        // Conjugate lookup: generate all legal moves, look up each child
+        // position via lookup_wdl (which handles captures/sub-tables properly)
+        std::optional<int> conjugate_search(const Board& board) const {
+            MoveList moves;
+            generateMoves(board, moves);
+            if (moves.empty()) return 1;  // Gana-pierde: no moves = WIN
+
+            int best = -2;
+            for (const Move& move : moves) {
+                Board child = makeMove(board, move);
+                if (child.white == 0) return -1;  // Gana-pierde: opponent has no pieces = we lose
+
+                // Child has conjugate material — recursively look it up
+                std::optional<int> child_wdl;
+                if (has_captures(child)) {
+                    child_wdl = capture_search(child);
+                } else {
+                    child_wdl = lookup_quiet(child);
+                }
+                if (!child_wdl) return std::nullopt;
+
+                int score = -(*child_wdl);
+                if (score > best) best = score;
+                if (best == 1) break;
+            }
+
+            return (best > -2) ? std::optional<int>(best) : std::nullopt;
+        }
+
+        static int value_to_wdl(Value v) {
+            switch (v) {
+                case Value::WIN: return 1;
+                case Value::DRAW: return 0;
+                case Value::LOSS: return -1;
+                default: return 0;
+            }
+        }
+    };
+
+    WasmCWDLTablebaseManager g_cwdl_manager;
+
+    // Neural network model
+    std::unique_ptr<nn::MLP> g_nn_model;
+
+    // Persistent searcher (keeps transposition table across searches)
+    std::unique_ptr<search::Searcher> g_searcher;
+
+    // Opening book
+    struct BookMove {
+        Move move;
+        double probability;
+        double q;  // average evaluation (Q = value_sum / visits)
+    };
+
+    // Q-based filtering threshold: exclude moves with Q more than this
+    // below the best move's Q value.
+    constexpr double BOOK_Q_THRESHOLD = 200.0;
+    std::unordered_map<uint64_t, std::vector<BookMove>> g_opening_book;
+    bool g_book_loaded = false;
+}
+
+// Load neural network model from typed array
+void loadNNModel(val typed_array) {
+    unsigned int length = typed_array["length"].as<unsigned int>();
+
+    // Bulk copy JS typed array to C++ buffer via typed_memory_view
+    std::vector<uint8_t> buffer(length);
+    val memoryView = val(typed_memory_view(length, buffer.data()));
+    memoryView.call<void>("set", typed_array);
+
+    // Write to virtual filesystem
+    const char* path = "/tmp/nn_model.bin";
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fwrite(buffer.data(), 1, buffer.size(), f);
+        fclose(f);
+
+        try {
+            g_nn_model = std::make_unique<nn::MLP>(path);
+        } catch (...) {
+            // Failed to load model
+        }
+    }
+}
+
+// Check if tablebases are available (asks JS)
+bool hasTablebases() {
+    val tablebasesAvailable = val::global("tablebasesAvailable");
+    if (tablebasesAvailable.isUndefined()) {
+        return false;
+    }
+    return tablebasesAvailable().as<bool>();
+}
+
+// Check if CWDL (WDL) tablebases are available
+bool hasCWDLTablebases() {
+    val cwdlAvail = val::global("cwdlAvailable");
+    if (cwdlAvail.isUndefined()) return false;
+    return cwdlAvail().as<bool>();
+}
+
+// Check if NN models are loaded
+bool hasNNModel() {
+    return g_nn_model != nullptr;
+}
+
+// Load opening book from .cbook text format
+void loadOpeningBook(const std::string& text) {
+    g_opening_book.clear();
+    g_book_loaded = false;
+
+    std::istringstream in(text);
+    std::string line;
+    uint64_t current_hash = 0;
+    bool have_position = false;
+
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        if (line[0] == 'P') {
+            Bb w, b, k;
+            if (sscanf(line.c_str(), "P %x %x %x", &w, &b, &k) == 3) {
+                Board board(w, b, k);
+                current_hash = board.position_hash();
+                have_position = true;
+                g_opening_book[current_hash].clear();
+            }
+        } else if (line[0] == 'M' && have_position) {
+            Bb fxt, cap;
+            double prob, q = 0.0;
+            int parsed = sscanf(line.c_str(), "M %x %x %lf %lf", &fxt, &cap, &prob, &q);
+            if (parsed >= 3) {
+                g_opening_book[current_hash].push_back({Move(fxt, cap), prob, q});
+            }
+        }
+    }
+
+    g_book_loaded = !g_opening_book.empty();
+}
+
+bool hasOpeningBook() {
+    return g_book_loaded;
+}
+
+// Filter book moves by Q value: keep only moves within BOOK_Q_THRESHOLD
+// of the best Q, then renormalize probabilities.
+// Returns filtered list (may be empty if input is empty).
+std::vector<BookMove> filterBookMoves(const std::vector<BookMove>& moves) {
+    if (moves.empty()) return {};
+
+    // Find best Q
+    double best_q = moves[0].q;
+    for (const auto& bm : moves) {
+        if (bm.q > best_q) best_q = bm.q;
+    }
+
+    // Filter to moves within threshold of best
+    std::vector<BookMove> filtered;
+    double total_prob = 0.0;
+    for (const auto& bm : moves) {
+        if (best_q - bm.q <= BOOK_Q_THRESHOLD) {
+            filtered.push_back(bm);
+            total_prob += bm.probability;
+        }
+    }
+
+    // Renormalize probabilities
+    if (total_prob > 0) {
+        for (auto& bm : filtered) {
+            bm.probability /= total_prob;
+        }
+    }
+
+    return filtered;
+}
+
+// Board wrapper for JS
+struct JSBoard {
+    Board board;
+    bool white_to_move;  // Track which side is to move in the game
+
+    JSBoard() : white_to_move(true) {}
+    JSBoard(const Board& b, bool wtm) : board(b), white_to_move(wtm) {}
+
+    // Create from bitboards
+    static JSBoard fromBitboards(uint32_t white, uint32_t black, uint32_t kings, bool white_to_move, unsigned n_reversible) {
+        Board b;
+        if (white_to_move) {
+            b.white = white;
+            b.black = black;
+            b.kings = kings;
+        } else {
+            // Flip to internal representation
+            b.white = flip(black);
+            b.black = flip(white);
+            b.kings = flip(kings);
+        }
+        b.n_reversible = n_reversible;
+        return JSBoard(b, white_to_move);
+    }
+
+    // Get bitboards (always from white's perspective for UI)
+    uint32_t getWhite() const {
+        return white_to_move ? board.white : flip(board.black);
+    }
+    uint32_t getBlack() const {
+        return white_to_move ? board.black : flip(board.white);
+    }
+    uint32_t getKings() const {
+        return white_to_move ? board.kings : flip(board.kings);
+    }
+    bool isWhiteToMove() const {
+        return white_to_move;
+    }
+
+    // Get piece count
+    int pieceCount() const {
+        return std::popcount(board.allPieces());
+    }
+
+    // Get reversible move counter (for 60-move draw rule)
+    int getNReversible() const {
+        return board.n_reversible;
+    }
+};
+
+// Move wrapper for JS
+struct JSMove {
+    uint32_t from_xor_to;
+    uint32_t captures;
+    std::vector<int> path;  // Full path for notation
+
+    JSMove() : from_xor_to(0), captures(0) {}
+    JSMove(const Move& m, const std::vector<int>& p) : from_xor_to(m.from_xor_to), captures(m.captures), path(p) {}
+
+    bool isCapture() const { return captures != 0; }
+
+    // Get from/to squares (1-32 indexed)
+    int getFrom() const {
+        if (path.size() >= 1) return path[0];
+        return 0;
+    }
+    int getTo() const {
+        if (path.size() >= 2) return path[path.size() - 1];
+        return 0;
+    }
+
+    // Get notation string
+    std::string notation() const {
+        if (path.empty()) return "";
+        std::string result = std::to_string(path[0]);
+        for (size_t i = 1; i < path.size(); ++i) {
+            result += (captures ? "x" : "-");
+            result += std::to_string(path[i]);
+        }
+        return result;
+    }
+
+    // Get path as JS array
+    val getPath() const {
+        val arr = val::array();
+        for (size_t i = 0; i < path.size(); ++i) {
+            arr.call<void>("push", path[i]);
+        }
+        return arr;
+    }
+};
+
+// Compute UI mask (32-bit) for a move: all path + captured squares in UI coordinates.
+// Bit i represents UI square (i+1).
+uint32_t computeUIMask(const std::vector<int>& path, Bb captures, bool white_to_move) {
+    uint32_t mask = 0;
+    for (int sq : path) {
+        mask |= white_to_move ? (1u << sq) : (1u << (31 - sq));
+    }
+    if (captures) {
+        mask |= white_to_move ? captures : flip(captures);
+    }
+    return mask;
+}
+
+// Get legal moves for a position - returns plain JS objects
+val getLegalMoves(const JSBoard& jsboard) {
+    // Generate moves with full path info, keeping all paths for UI selection
+    std::vector<FullMove> full_moves;
+    generateFullMoves(jsboard.board, full_moves, true);  // keepAllPaths = true
+
+    val result = val::array();
+    for (const auto& fm : full_moves) {
+        // Adjust path for perspective
+        val path = val::array();
+        for (int sq : fm.path) {
+            if (jsboard.white_to_move) {
+                path.call<void>("push", sq + 1);
+            } else {
+                path.call<void>("push", 32 - sq);
+            }
+        }
+
+        // Create plain JS object instead of wrapped C++ object
+        val move = val::object();
+        move.set("from_xor_to", fm.move.from_xor_to);
+        move.set("captures", fm.move.captures);
+        move.set("path", path);
+        move.set("from", path[0]);
+        move.set("to", path[path["length"].as<int>() - 1]);
+        move.set("isCapture", fm.move.isCapture());
+
+        // Build notation string
+        move.set("notation", buildNotation(fm.path, fm.move.isCapture(), jsboard.white_to_move));
+
+        // UI mask for flexible move input
+        move.set("mask", computeUIMask(fm.path, fm.move.captures, jsboard.white_to_move));
+
+        result.call<void>("push", move);
+    }
+    return result;
+}
+
+// Make a move - accepts plain JS object with from_xor_to and captures
+JSBoard makeJSMove(const JSBoard& jsboard, val jsmove) {
+    Move m;
+    m.from_xor_to = jsmove["from_xor_to"].as<uint32_t>();
+    m.captures = jsmove["captures"].as<uint32_t>();
+
+    Board new_board = makeMove(jsboard.board, m);
+    return JSBoard(new_board, !jsboard.white_to_move);
+}
+
+// Helper to create a move JS object from Move and path
+val createMoveObject(const Move& m, const std::vector<int>& path, bool white_to_move) {
+    val jsPath = val::array();
+    for (int sq : path) {
+        if (white_to_move) {
+            jsPath.call<void>("push", sq + 1);
+        } else {
+            jsPath.call<void>("push", 32 - sq);
+        }
+    }
+
+    val move = val::object();
+    move.set("from_xor_to", m.from_xor_to);
+    move.set("captures", m.captures);
+    move.set("path", jsPath);
+    if (jsPath["length"].as<int>() > 0) {
+        move.set("from", jsPath[0]);
+        move.set("to", jsPath[jsPath["length"].as<int>() - 1]);
+    } else {
+        move.set("from", 0);
+        move.set("to", 0);
+    }
+    move.set("isCapture", m.isCapture());
+    move.set("notation", buildNotation(path, m.isCapture(), white_to_move));
+    move.set("mask", computeUIMask(path, m.captures, white_to_move));
+
+    return move;
+}
+
+// Forward declaration
+val doSearchWithCallback(const JSBoard& jsboard, int max_depth, double soft_time,
+                         double hard_time, val progress_callback, bool analyze_mode,
+                         bool ponder_mode);
+
+// Perform search without callback - wrapper for backwards compatibility
+val doSearch(const JSBoard& jsboard, int max_depth, double soft_time, double hard_time) {
+    return doSearchWithCallback(jsboard, max_depth, soft_time, hard_time, val::null(), false, false);
+}
+
+// Helper to build a result val from SearchResult and board
+val buildSearchResultVal(const search::SearchResult& sr, const Board& board, bool white_to_move) {
+    val result = val::object();
+
+    // Generate full moves for path resolution
+    std::vector<FullMove> full_moves;
+    generateFullMoves(board, full_moves);
+
+    if (sr.best_move.from_xor_to != 0) {
+        for (const auto& fm : full_moves) {
+            if (fm.move.from_xor_to == sr.best_move.from_xor_to &&
+                fm.move.captures == sr.best_move.captures) {
+                result.set("best_move", createMoveObject(fm.move, fm.path, white_to_move));
+                break;
+            }
+        }
+    }
+
+    // Don't report score for forced moves (nodes==0, depth==1): the search
+    // was skipped so the score is just a rough NN eval.  Omitting it lets the
+    // eval bar keep whatever value it had from the previous real search.
+    if (sr.nodes > 0 || sr.depth == 0) {
+        result.set("score", sr.score);
+    }
+    result.set("depth", sr.depth);
+    result.set("nodes", static_cast<double>(sr.nodes));
+    result.set("tb_hits", static_cast<double>(sr.tb_hits));
+
+    // Secondary search phase indicator
+    if (sr.phase == search::SearchPhase::SECONDARY_WINNING) {
+        result.set("phase", std::string("winning"));
+    } else if (sr.phase == search::SearchPhase::SECONDARY_LOSING) {
+        result.set("phase", std::string("losing"));
+    }
+
+    // Build PV with full paths for captures
+    val pv = val::array();
+    if (!sr.pv.empty()) {
+        Board pos = board;
+        bool white_view = white_to_move;
+        for (const Move& m : sr.pv) {
+            // Generate full moves to get the complete path for captures
+            std::vector<FullMove> full_moves;
+            generateFullMoves(pos, full_moves);
+
+            std::string notation;
+            bool found = false;
+            for (const auto& fm : full_moves) {
+                if (fm.move.from_xor_to == m.from_xor_to &&
+                    fm.move.captures == m.captures) {
+                    notation = buildNotation(fm.path, m.isCapture(), white_view);
+                    found = true;
+                    break;
+                }
+            }
+
+            // Fallback to simple from-to notation if not found
+            if (!found) {
+                Bb occupied = pos.white | pos.black;
+                int from_bit = __builtin_ctz(m.from_xor_to & occupied);
+                int to_bit = __builtin_ctz(m.from_xor_to ^ (1u << from_bit));
+                int disp_from = white_view ? (from_bit + 1) : (32 - from_bit);
+                int disp_to = white_view ? (to_bit + 1) : (32 - to_bit);
+                notation = std::to_string(disp_from) +
+                           (m.isCapture() ? "x" : "-") +
+                           std::to_string(disp_to);
+            }
+
+            pv.call<void>("push", notation);
+            pos = makeMove(pos, m);
+            white_view = !white_view;
+        }
+    }
+    result.set("pv", pv);
+
+    // Root move scores (populated in ponder mode)
+    if (!sr.root_scores.empty()) {
+        std::vector<FullMove> all_full_moves;
+        generateFullMoves(board, all_full_moves);
+
+        val root_moves_arr = val::array();
+        for (const auto& [move, score] : sr.root_scores) {
+            std::string notation;
+            for (const auto& fm : all_full_moves) {
+                if (fm.move.from_xor_to == move.from_xor_to &&
+                    fm.move.captures == move.captures) {
+                    notation = buildNotation(fm.path, move.isCapture(), white_to_move);
+                    break;
+                }
+            }
+            val entry = val::object();
+            entry.set("notation", notation);
+            entry.set("score", score);
+            root_moves_arr.call<void>("push", entry);
+        }
+        result.set("rootMoves", root_moves_arr);
+    }
+
+    return result;
+}
+
+// Perform search with optional progress callback
+bool g_use_book = true;
+
+void setUseBook(bool use_book) {
+    g_use_book = use_book;
+}
+
+val doSearchWithCallback(const JSBoard& jsboard, int max_depth, double soft_time,
+                         double hard_time, val progress_callback, bool analyze_mode = false,
+                         bool ponder_mode = false) {
+    val result = val::object();
+    int piece_count = jsboard.pieceCount();
+
+    // Check if tablebases are available
+    bool tb_available = hasTablebases();
+
+    // Try tablebase lookup first for endgame wins/losses (draws fall through to search)
+    if (piece_count <= 5 && tb_available) {
+        Move best_move;
+        tablebase::DTM best_dtm;
+        if (g_tb_manager.find_best_move(jsboard.board, best_move, best_dtm)
+            && best_dtm != tablebase::DTM_DRAW) {
+            std::vector<FullMove> full_moves;
+            generateFullMoves(jsboard.board, full_moves);
+
+            for (const auto& fm : full_moves) {
+                if (fm.move.from_xor_to == best_move.from_xor_to &&
+                    fm.move.captures == best_move.captures) {
+                    result.set("best_move", createMoveObject(fm.move, fm.path, jsboard.white_to_move));
+                    break;
+                }
+            }
+
+            int score;
+            if (best_dtm > 0) {
+                score = 30000 - 2 * best_dtm + 1;
+            } else {
+                score = -30000 + 2 * (-best_dtm);
+            }
+            result.set("score", score);
+            result.set("depth", 1);
+            result.set("nodes", 1);
+            result.set("tb_hits", 1);
+            result.set("pv", val::array());
+            return result;
+        }
+    }
+
+    // Check opening book (skip in analysis/ponder — we want a real search)
+    if (g_use_book && g_book_loaded && !analyze_mode && !ponder_mode) {
+        uint64_t pos_hash = jsboard.board.position_hash();
+        auto it = g_opening_book.find(pos_hash);
+        if (it != g_opening_book.end() && !it->second.empty()) {
+            // Filter by Q value and renormalize
+            auto filtered = filterBookMoves(it->second);
+            if (!filtered.empty()) {
+                // Sample from filtered probability distribution
+                double r = g_rng.next_double();
+                double cumulative = 0.0;
+                const BookMove* selected = &filtered[0];
+                for (const auto& bm : filtered) {
+                    cumulative += bm.probability;
+                    if (r < cumulative) { selected = &bm; break; }
+                }
+                // Find full move info (path) for the selected move
+                std::vector<FullMove> full_moves;
+                generateFullMoves(jsboard.board, full_moves);
+                for (const auto& fm : full_moves) {
+                    if (fm.move.from_xor_to == selected->move.from_xor_to &&
+                        fm.move.captures == selected->move.captures) {
+                        result.set("best_move", createMoveObject(fm.move, fm.path, jsboard.white_to_move));
+                        result.set("score", 0);
+                        result.set("depth", 0);
+                        result.set("nodes", 0);
+                        result.set("tb_hits", 0);
+                        result.set("pv", val::array());
+                        result.set("book", true);
+                        return result;
+                    }
+                }
+            }
+            // If no filtered moves or move not found, fall through to search
+        }
+    }
+
+    // Compute book moves for the current position (for display during analysis)
+    // Uses Q-filtered probabilities to show what the engine would actually play
+    val bookMoves = val::array();
+    if (g_book_loaded) {
+        uint64_t pos_hash = jsboard.board.position_hash();
+        auto book_it = g_opening_book.find(pos_hash);
+        if (book_it != g_opening_book.end() && !book_it->second.empty()) {
+            auto filtered = filterBookMoves(book_it->second);
+            std::vector<FullMove> full_moves;
+            generateFullMoves(jsboard.board, full_moves);
+            for (const auto& bm : filtered) {
+                for (const auto& fm : full_moves) {
+                    if (fm.move.from_xor_to == bm.move.from_xor_to &&
+                        fm.move.captures == bm.move.captures) {
+                        val entry = val::object();
+                        entry.set("notation", buildNotation(fm.path, bm.move.isCapture(), jsboard.white_to_move));
+                        entry.set("probability", bm.probability);
+                        entry.set("q", bm.q);
+                        bookMoves.call<void>("push", entry);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Set up evaluation function (no noise - variety handled by search)
+    auto eval_func = [](const Board& board, int /*ply*/) -> int {
+        if (g_nn_model) {
+            return g_nn_model->evaluate(board);
+        } else {
+            int white_men = std::popcount(board.whitePawns());
+            int white_kings = std::popcount(board.whiteQueens());
+            int black_men = std::popcount(board.blackPawns());
+            int black_kings = std::popcount(board.blackQueens());
+            return (white_men - black_men) * 100 + (white_kings - black_kings) * 300;
+        }
+    };
+
+    // Lazily create persistent searcher (keeps TT across searches)
+    if (!g_searcher) {
+        g_searcher = std::make_unique<search::Searcher>("", 0);
+    }
+    g_searcher->set_eval(eval_func);
+    g_searcher->set_analyze_mode(analyze_mode);
+    g_searcher->set_ponder_mode(ponder_mode);
+
+    // Reset and set stop flag for this search
+    g_stop_flag.store(false, std::memory_order_relaxed);
+    g_searcher->set_stop_flag(&g_stop_flag);
+
+    // Set up DTM probe function if tablebases are available
+    if (tb_available) {
+        g_searcher->set_dtm_probe([](const Board& b) {
+            return g_tb_manager.lookup_dtm(b);
+        }, 5);  // 5-piece tablebases
+    }
+
+    // Set up WDL probe function if CWDL tablebases are available
+    {
+        val cwdlAvail = val::global("cwdlAvailable");
+        if (!cwdlAvail.isUndefined() && cwdlAvail().as<bool>()) {
+            g_searcher->set_wdl_probe([](const Board& b) -> std::optional<int> {
+                return g_cwdl_manager.lookup_wdl(b);
+            }, 8);  // 6-8 piece WDL tablebases
+        }
+    }
+
+    // Set progress callback if provided
+    bool has_callback = !progress_callback.isNull() && !progress_callback.isUndefined();
+    if (has_callback) {
+        g_searcher->set_progress_callback([&](const search::SearchResult& sr) {
+            val update = buildSearchResultVal(sr, jsboard.board, jsboard.white_to_move);
+            if (bookMoves["length"].as<int>() > 0) {
+                update.set("bookMoves", bookMoves);
+            }
+            progress_callback.call<void>("call", val::null(), update);
+        });
+    }
+
+    search::SearchResult sr;
+    try {
+        sr = g_searcher->search(jsboard.board, max_depth,
+                             search::TimeControl::with_time(soft_time, hard_time));
+    } catch (const search::SearchInterrupted&) {
+        // Search was interrupted - return minimal result
+        val result = val::object();
+        result.set("error", "Search interrupted");
+        return result;
+    } catch (const std::exception& e) {
+        val result = val::object();
+        result.set("error", std::string("Search exception: ") + e.what());
+        return result;
+    } catch (...) {
+        val result = val::object();
+        result.set("error", "Search threw unknown exception");
+        return result;
+    }
+    val final_result = buildSearchResultVal(sr, jsboard.board, jsboard.white_to_move);
+    if (bookMoves["length"].as<int>() > 0) {
+        final_result.set("bookMoves", bookMoves);
+    }
+    return final_result;
+}
+
+// Probe tablebase for current position (returns DTM or null)
+val probeDTM(const JSBoard& jsboard) {
+    if (!hasTablebases()) {
+        return val::null();
+    }
+
+    tablebase::DTM dtm = g_tb_manager.lookup_dtm(jsboard.board);
+    if (dtm == tablebase::DTM_UNKNOWN) {
+        return val::null();
+    }
+
+    return val(static_cast<int>(dtm));
+}
+
+// Get initial board position
+JSBoard getInitialBoard() {
+    return JSBoard(Board(), true);
+}
+
+// Parse a move from notation (e.g., "9-13" or "9x14x23")
+val doParseMove(const JSBoard& jsboard, const std::string& notation) {
+    auto result = ::parseMove(jsboard.board, notation, !jsboard.white_to_move);
+    if (!result.has_value()) {
+        return val::null();
+    }
+
+    return createMoveObject(result->move, result->path, jsboard.white_to_move);
+}
+
+// Get engine version string
+std::string getEngineVersion() {
+    return ENGINE_VERSION;
+}
+
+// Stop ongoing search
+void stopSearch() {
+    g_stop_flag.store(true, std::memory_order_relaxed);
+}
+
+// Get address of stop flag for direct memory access from JavaScript
+std::uintptr_t getStopFlagAddress() {
+    return reinterpret_cast<std::uintptr_t>(&g_stop_flag);
+}
+
+// Emscripten bindings
+EMSCRIPTEN_BINDINGS(checkers_engine) {
+    // JSBoard
+    class_<JSBoard>("Board")
+        .constructor<>()
+        .function("getWhite", &JSBoard::getWhite)
+        .function("getBlack", &JSBoard::getBlack)
+        .function("getKings", &JSBoard::getKings)
+        .function("isWhiteToMove", &JSBoard::isWhiteToMove)
+        .function("pieceCount", &JSBoard::pieceCount)
+        .function("getNReversible", &JSBoard::getNReversible)
+        .class_function("fromBitboards", &JSBoard::fromBitboards);
+
+    // Free functions
+    function("getInitialBoard", &getInitialBoard);
+    function("getLegalMoves", &getLegalMoves);
+    function("makeMove", &makeJSMove);
+    function("search", &doSearch);
+    function("searchWithCallback", &doSearchWithCallback);
+    function("setUseBook", &setUseBook);
+    function("probeDTM", &probeDTM);
+    function("parseMove", &doParseMove);
+    function("loadNNModel", &loadNNModel);
+    function("hasTablebases", &hasTablebases);
+    function("hasCWDLTablebases", &hasCWDLTablebases);
+    function("hasNNModel", &hasNNModel);
+    function("getEngineVersion", &getEngineVersion);
+    function("stopSearch", &stopSearch);
+    function("getStopFlagAddress", &getStopFlagAddress);
+    function("loadOpeningBook", &loadOpeningBook);
+    function("hasOpeningBook", &hasOpeningBook);
+}
