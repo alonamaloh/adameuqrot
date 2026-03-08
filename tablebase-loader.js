@@ -199,7 +199,7 @@ export class TablebaseLoader {
         }
 
         this.opfsRoot = await navigator.storage.getDirectory();
-        this.tbDirectory = await this.opfsRoot.getDirectoryHandle('tablebases', { create: true });
+        this.tbDirectory = await this.opfsRoot.getDirectoryHandle('tablebases-gp', { create: true });
         this.isInitialized = true;
     }
 
