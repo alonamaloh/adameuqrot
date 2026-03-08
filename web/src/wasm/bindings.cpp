@@ -893,7 +893,7 @@ val doSearchWithCallback(const JSBoard& jsboard, int max_depth, double soft_time
             int white_kings = std::popcount(board.whiteQueens());
             int black_men = std::popcount(board.blackPawns());
             int black_kings = std::popcount(board.blackQueens());
-            return (white_men - black_men) * 100 + (white_kings - black_kings) * 300;
+            return (black_men - white_men) * 100 + (black_kings - white_kings) * 300;
         }
     };
 

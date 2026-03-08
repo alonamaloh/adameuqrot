@@ -49,7 +49,7 @@ inline int draw_eval(const Board& board) {
   int wk = std::popcount(board.whiteQueens());
   int bp = std::popcount(board.blackPawns());
   int bk = std::popcount(board.blackQueens());
-  int material = (wp - bp) * 100 + (wk - bk) * 320;
+  int material = (bp - wp) * 100 + (bk - wk) * 320;
   int noise = static_cast<int>(board.hash() % 21) - 10;
   return material + noise;
 }

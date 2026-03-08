@@ -742,7 +742,7 @@ SearchResult Searcher::search(const Board& board, int max_depth, const TimeContr
   generateMoves(board, root_moves);
 
   if (root_moves.empty()) {
-    result.score = mated_score(0);
+    result.score = mate_score(0);
     return result;
   }
 

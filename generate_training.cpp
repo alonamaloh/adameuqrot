@@ -126,7 +126,7 @@ int play_game(RandomBits& rng, search::Searcher& searcher,
     tc.hard_node_limit = max_nodes * 5;
     auto result = searcher.search(board, 100, tc);
     if (result.best_move.from_xor_to == 0) {
-      int outcome = (ply % 2 == 0) ? -1 : +1;
+      int outcome = (ply % 2 == 0) ? +1 : -1;
       for (auto& pos : game_positions) {
         pos.outcome = (pos.ply % 2 == 0) ? outcome : -outcome;
         positions.push_back(pos);

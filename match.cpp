@@ -56,7 +56,7 @@ int play_game(const Board& start, search::Searcher& white, search::Searcher& bla
         auto result = searcher.search(board, 100, tc);
 
         if (result.best_move.from_xor_to == 0) {
-            return white_to_move ? -1 : +1;
+            return white_to_move ? +1 : -1;
         }
 
         board = makeMove(board, result.best_move);
