@@ -85,7 +85,7 @@ async function init() {
 
         // Load opening book
         try {
-            const bookResponse = await fetch('./opening-a822ebc72d1b.cbook');
+            const bookResponse = await fetch('./opening-65db35e9aac9.cbook');
             if (bookResponse.ok) {
                 const bookText = await bookResponse.text();
                 await engine.loadOpeningBook(bookText);
