@@ -44,7 +44,7 @@ async function initTablebaseSyncHandles() {
         const opfsRoot = await navigator.storage.getDirectory();
         let tbDir;
         try {
-            tbDir = await opfsRoot.getDirectoryHandle('tablebases', { create: false });
+            tbDir = await opfsRoot.getDirectoryHandle('tablebases-gp', { create: false });
         } catch (e) {
             console.log('No tablebases directory found');
             return;
